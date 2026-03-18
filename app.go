@@ -620,32 +620,58 @@ func (a *App) scanAccountByPath(path string) error {
 	infos.Total = 0
 	infos.CurrentAccount = ""
 
+	log.Printf("scanAccountByPath called with path: [%s]", path)
+
+	// 支持新版微信目录结构（直接扫描当前目录下的 wxid 文件夹）
+	// 同时兼容旧版结构（User 子目录）
+	var scanPath string
+	var usePrefix string
+
 	userPath := path + "\\User\\"
-	if _, err := os.Stat(userPath); err != nil {
+	if _, err := os.Stat(userPath); err == nil {
+		// 旧版结构：有 User 子目录
+		scanPath = userPath
+		usePrefix = "\\User\\"
+		log.Printf("Using old WeChat structure, scanPath: [%s]", scanPath)
+	} else {
+		// 新版结构：直接扫描当前目录
+		scanPath = path
+		usePrefix = ""
+		log.Printf("Using new WeChat structure, scanPath: [%s]", scanPath)
+	}
+
+	dirs, err := os.ReadDir(scanPath)
+	if err != nil {
+		log.Println("ReadDir error:", err)
 		return err
 	}
 
-	dirs, err := os.ReadDir(userPath)
-	if err != nil {
-		log.Println("ReadDir", err)
-		return err
-	}
+	log.Printf("Found %d directories in scanPath", len(dirs))
 
 	for i := range dirs {
 		if !dirs[i].Type().IsDir() {
 			continue
 		}
-		log.Println("dirs[i].Name():", dirs[i].Name())
-		resPath := path + "\\User\\" + dirs[i].Name()
-		prefixResPath := "\\User\\" + dirs[i].Name()
-		info, err := wechat.WechatGetAccountInfo(resPath, prefixResPath, dirs[i].Name())
+		dirName := dirs[i].Name()
+		log.Printf("Checking directory: [%s]", dirName)
+		// 跳过非微信账号目录（不以 wxid 或 wxid_ 开头）
+		if !strings.HasPrefix(dirName, "wxid") {
+			log.Printf("Skipping non-wxid directory: [%s]", dirName)
+			continue
+		}
+		log.Printf("Found wxid account directory: [%s]", dirName)
+		resPath := scanPath + "\\" + dirName
+		prefixResPath := usePrefix + dirName
+		log.Printf("Calling WechatGetAccountInfo with resPath: [%s]", resPath)
+		info, err := wechat.WechatGetAccountInfo(resPath, prefixResPath, dirName)
 		if err != nil {
-			log.Println("GetWechatLocalAccountInfo", err)
+			log.Printf("GetWechatLocalAccountInfo failed for [%s]: %v", dirName, err)
 			continue
 		}
 
 		infos.Info = append(infos.Info, *info)
 		infos.Total += 1
+		log.Printf("Successfully added account: [%s], total: %d", dirName, infos.Total)
 	}
 
 	users := make([]string, 0)

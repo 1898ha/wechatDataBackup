@@ -298,67 +298,157 @@ func CreateWechatDataProvider(resPath string, prefixRes string) (*WechatDataProv
 	provider.resPath = resPath
 	provider.prefixResPath = prefixRes
 	provider.msgDBs = make([]*wechatMsgDB, 0)
-	log.Println(resPath)
+	log.Println("CreateWechatDataProvider resPath:", resPath)
 
 	userName := filepath.Base(resPath)
-	MicroMsgDBPath := resPath + "\\Msg\\" + MicroMsgDB
-	if _, err := os.Stat(MicroMsgDBPath); err != nil {
-		log.Println("CreateWechatDataProvider failed", MicroMsgDBPath, err)
-		return provider, err
-	}
-	microMsg, err := sql.Open("sqlite3", MicroMsgDBPath)
-	if err != nil {
-		log.Printf("open db %s error: %v", MicroMsgDBPath, err)
-		return provider, err
-	}
 
+	// 检测新版还是旧版微信数据库结构
+	var microMsg *sql.DB
 	var openIMContact *sql.DB
-	OpenIMContactDBPath := resPath + "\\Msg\\" + OpenIMContactDB
-	if _, err := os.Stat(OpenIMContactDBPath); err == nil {
-		openIMContact, err = sql.Open("sqlite3", OpenIMContactDBPath)
-		if err != nil {
-			log.Printf("open db %s error: %v", OpenIMContactDBPath, err)
+	var userData *sql.DB
+	var err error
+
+	// 新版微信路径：db_storage\message\
+	newMsgPath := resPath + "\\db_storage\\message\\"
+	// 旧版微信路径：Msg\
+	oldMsgPath := resPath + "\\Msg\\"
+
+	useNewStructure := false
+	if _, err := os.Stat(newMsgPath); err == nil {
+		// 检查是否有 message_0.db
+		if _, err := os.Stat(newMsgPath + "message_0.db"); err == nil {
+			useNewStructure = true
+			log.Println("Using new WeChat database structure (db_storage/message)")
 		}
 	}
 
-	UserDataDBPath := resPath + "\\Msg\\" + UserDataDB
-	userData := openUserDataDB(UserDataDBPath)
-	if userData == nil {
-		log.Printf("open db %s error: %v", UserDataDBPath, err)
-		return provider, err
-	}
-
-	msgDBPath := fmt.Sprintf("%s\\Msg\\Multi\\MSG.db", provider.resPath)
-	if _, err := os.Stat(msgDBPath); err == nil {
-		log.Println("msgDBPath", msgDBPath)
-		msgDB, err := wechatOpenMsgDB(msgDBPath)
-		if err != nil {
-			log.Printf("open db %s error: %v", msgDBPath, err)
+	if useNewStructure {
+		// 新版微信数据库结构
+		// 使用 contact 目录下的数据库作为联系人数据库
+		contactDBPath := resPath + "\\db_storage\\contact\\contact_0.db"
+		if _, err := os.Stat(contactDBPath); err == nil {
+			microMsg, err = sql.Open("sqlite3", contactDBPath)
+			if err != nil {
+				log.Printf("open new contact db %s error: %v", contactDBPath, err)
+				return provider, err
+			}
+			log.Println("Opened new contact DB:", contactDBPath)
 		} else {
+			// 尝试使用 message 数据库
+			messageDBPath := newMsgPath + "message_0.db"
+			microMsg, err = sql.Open("sqlite3", messageDBPath)
+			if err != nil {
+				log.Printf("open new message db %s error: %v", messageDBPath, err)
+				return provider, err
+			}
+			log.Println("Opened new message DB as contact DB:", messageDBPath)
+		}
+
+		// 新版使用 message_0.db, message_1.db, ...
+		index := 0
+		for {
+			msgDBPath := fmt.Sprintf("%s\\db_storage\\message\\message_%d.db", provider.resPath, index)
+			if _, err := os.Stat(msgDBPath); err != nil {
+				log.Printf("message db scan end at index %d, last path: %s\n", index, msgDBPath)
+				break
+			}
+
+			msgDB, err := wechatOpenMsgDB(msgDBPath)
+			if err != nil {
+				log.Printf("open db %s error: %v", msgDBPath, err)
+				index += 1
+				continue
+			}
 			provider.msgDBs = append(provider.msgDBs, msgDB)
-			log.Printf("MSG.db start %d - %d end\n", msgDB.startTime, msgDB.endTime)
-			provider.IsShareData = true
-		}
-	}
-
-	index := 0
-	for {
-		msgDBPath := fmt.Sprintf("%s\\Msg\\Multi\\MSG%d.db", provider.resPath, index)
-		if _, err := os.Stat(msgDBPath); err != nil {
-			log.Println("msgDBPath end", msgDBPath)
-			break
-		}
-
-		msgDB, err := wechatOpenMsgDB(msgDBPath)
-		if err != nil {
-			log.Printf("open db %s error: %v", msgDBPath, err)
+			log.Printf("message_%d.db loaded\n", index)
 			index += 1
-			continue
 		}
-		provider.msgDBs = append(provider.msgDBs, msgDB)
-		log.Printf("MSG%d.db start %d - %d end\n", index, msgDB.startTime, msgDB.endTime)
-		index += 1
+
+		// 尝试打开 session 数据库
+		sessionDBPath := resPath + "\\db_storage\\session\\session_0.db"
+		if _, err := os.Stat(sessionDBPath); err == nil {
+			userData, err = sql.Open("sqlite3", sessionDBPath)
+			if err != nil {
+				log.Printf("open session db %s error: %v", sessionDBPath, err)
+				userData = nil
+			} else {
+				log.Println("Opened session DB:", sessionDBPath)
+			}
+		}
+
+		// 尝试打开 media 数据库
+		mediaDBPath := newMsgPath + "media_0.db"
+		if _, err := os.Stat(mediaDBPath); err == nil {
+			openIMContact, err = sql.Open("sqlite3", mediaDBPath)
+			if err != nil {
+				log.Printf("open media db %s error: %v", mediaDBPath, err)
+				openIMContact = nil
+			} else {
+				log.Println("Opened media DB:", mediaDBPath)
+			}
+		}
+
+	} else {
+		// 旧版微信数据库结构
+		MicroMsgDBPath := oldMsgPath + MicroMsgDB
+		if _, err := os.Stat(MicroMsgDBPath); err != nil {
+			log.Println("CreateWechatDataProvider failed", MicroMsgDBPath, err)
+			return provider, err
+		}
+		microMsg, err = sql.Open("sqlite3", MicroMsgDBPath)
+		if err != nil {
+			log.Printf("open db %s error: %v", MicroMsgDBPath, err)
+			return provider, err
+		}
+
+		OpenIMContactDBPath := oldMsgPath + OpenIMContactDB
+		if _, err := os.Stat(OpenIMContactDBPath); err == nil {
+			openIMContact, err = sql.Open("sqlite3", OpenIMContactDBPath)
+			if err != nil {
+				log.Printf("open db %s error: %v", OpenIMContactDBPath, err)
+			}
+		}
+
+		UserDataDBPath := oldMsgPath + UserDataDB
+		userData = openUserDataDB(UserDataDBPath)
+		if userData == nil {
+			log.Printf("open db %s error: %v", UserDataDBPath, err)
+			return provider, err
+		}
+
+		msgDBPath := fmt.Sprintf("%sMsg\\Multi\\MSG.db", provider.resPath)
+		if _, err := os.Stat(msgDBPath); err == nil {
+			log.Println("msgDBPath", msgDBPath)
+			msgDB, err := wechatOpenMsgDB(msgDBPath)
+			if err != nil {
+				log.Printf("open db %s error: %v", msgDBPath, err)
+			} else {
+				provider.msgDBs = append(provider.msgDBs, msgDB)
+				log.Printf("MSG.db start %d - %d end\n", msgDB.startTime, msgDB.endTime)
+				provider.IsShareData = true
+			}
+		}
+
+		index := 0
+		for {
+			msgDBPath := fmt.Sprintf("%sMsg\\Multi\\MSG%d.db", provider.resPath, index)
+			if _, err := os.Stat(msgDBPath); err != nil {
+				log.Println("msgDBPath end", msgDBPath)
+				break
+			}
+
+			msgDB, err := wechatOpenMsgDB(msgDBPath)
+			if err != nil {
+				log.Printf("open db %s error: %v", msgDBPath, err)
+				index += 1
+				continue
+			}
+			provider.msgDBs = append(provider.msgDBs, msgDB)
+			log.Printf("MSG%d.db start %d - %d end\n", index, msgDB.startTime, msgDB.endTime)
+			index += 1
+		}
 	}
+
 	sort.Sort(byTime(provider.msgDBs))
 	for _, db := range provider.msgDBs {
 		log.Printf("%s start %d - %d end\n", db.path, db.startTime, db.endTime)
@@ -370,13 +460,15 @@ func CreateWechatDataProvider(resPath string, prefixRes string) (*WechatDataProv
 	provider.SelfInfo, err = provider.WechatGetUserInfoByNameOnCache(userName)
 	if err != nil {
 		log.Printf("WechatGetUserInfoByName %s failed: %v", userName, err)
-		return provider, err
+		// 不返回错误，继续执行
+		log.Println("Continuing despite GetUserInfo error...")
 	}
 
 	provider.ContactList, err = provider.wechatGetAllContact()
 	if err != nil {
 		log.Println("wechatGetAllContact failed", err)
-		return provider, err
+		// 不返回错误，继续执行
+		log.Println("Continuing despite GetContact error...")
 	}
 	sort.Sort(byName(provider.ContactList.Users))
 	log.Println("Contact number:", provider.ContactList.Total)
@@ -1371,20 +1463,45 @@ func (P *WechatDataProvider) wechatGetAllContact() (*WeChatContactList, error) {
 }
 
 func WechatGetAccountInfo(resPath, prefixRes, accountName string) (*WeChatAccountInfo, error) {
-	MicroMsgDBPath := resPath + "\\Msg\\" + MicroMsgDB
-	if _, err := os.Stat(MicroMsgDBPath); err != nil {
-		log.Println("MicroMsgDBPath:", MicroMsgDBPath, err)
-		return nil, err
-	}
+	info := &WeChatAccountInfo{}
+	info.AccountName = accountName
 
-	microMsg, err := sql.Open("sqlite3", MicroMsgDBPath)
-	if err != nil {
-		log.Printf("open db %s error: %v", MicroMsgDBPath, err)
-		return nil, err
+	// 检测新版还是旧版微信数据库结构
+	var microMsg *sql.DB
+	var err error
+
+	// 新版微信路径
+	newContactPath := resPath + "\\db_storage\\contact\\contact_0.db"
+	oldMsgPath := resPath + "\\Msg\\" + MicroMsgDB
+
+	if _, err := os.Stat(newContactPath); err == nil {
+		// 新版微信
+		microMsg, err = sql.Open("sqlite3", newContactPath)
+		if err != nil {
+			log.Printf("open new contact db %s error: %v", newContactPath, err)
+			// 尝试用旧版路径
+			microMsg, err = sql.Open("sqlite3", oldMsgPath)
+			if err != nil {
+				log.Printf("open old db %s error: %v", oldMsgPath, err)
+				return info, nil // 返回基本信息，不报错
+			}
+		}
+		log.Println("WechatGetAccountInfo using new DB:", newContactPath)
+	} else if _, err := os.Stat(oldMsgPath); err == nil {
+		// 旧版微信
+		microMsg, err = sql.Open("sqlite3", oldMsgPath)
+		if err != nil {
+			log.Printf("open db %s error: %v", oldMsgPath, err)
+			return info, nil
+		}
+		log.Println("WechatGetAccountInfo using old DB:", oldMsgPath)
+	} else {
+		log.Println("No valid database found, returning basic account info")
+		// 返回基本信息，使用账号名称作为昵称
+		info.NickName = accountName
+		return info, nil
 	}
 	defer microMsg.Close()
-
-	info := &WeChatAccountInfo{}
 
 	var UserName, Alias, ReMark, NickName string
 	querySql := fmt.Sprintf("select ifnull(UserName,'') as UserName, ifnull(Alias,'') as Alias, ifnull(ReMark,'') as ReMark, ifnull(NickName,'') as NickName from Contact where UserName='%s';", accountName)
@@ -1392,7 +1509,9 @@ func WechatGetAccountInfo(resPath, prefixRes, accountName string) (*WeChatAccoun
 	err = microMsg.QueryRow(querySql).Scan(&UserName, &Alias, &ReMark, &NickName)
 	if err != nil {
 		log.Println("not found User:", err)
-		return nil, err
+		// 使用账号名称作为昵称
+		info.NickName = accountName
+		return info, nil
 	}
 
 	log.Printf("UserName %s, Alias %s, ReMark %s, NickName %s\n", UserName, Alias, ReMark, NickName)

@@ -28,14 +28,15 @@ import (
 )
 
 type WeChatInfo struct {
-	ProcessID   uint32
-	FilePath    string
-	AcountName  string
-	Version     string
-	Is64Bits    bool
-	DllBaseAddr uintptr
-	DllBaseSize uint32
-	DBKey       string
+	ProcessID    uint32
+	KeyProcessID uint32  // Process ID containing WeChatWin.dll (for key extraction)
+	FilePath     string
+	AcountName   string
+	Version      string
+	Is64Bits     bool
+	DllBaseAddr  uintptr
+	DllBaseSize  uint32
+	DBKey        string
 }
 
 type WeChatInfoList struct {
@@ -585,51 +586,94 @@ func GetWeChatInfo() (list *WeChatInfoList) {
 	list.Info = make([]WeChatInfo, 0)
 	list.Total = 0
 
+	log.Println("Scanning for WeChat processes...")
+
 	processes, err := process.Processes()
 	if err != nil {
 		log.Println("Error getting processes:", err)
 		return
 	}
 
+	// Pass 1: Find all processes with open media databases (database processes)
+	dbProcesses := make([]WeChatInfo, 0)
 	for _, p := range processes {
 		name, err := p.Name()
 		if err != nil {
 			continue
 		}
-		info := WeChatInfo{}
-		if name == "WeChat.exe" {
+		// Debug: log all WeChat-related processes found
+		if strings.Contains(strings.ToLower(name), "weixin") || strings.Contains(strings.ToLower(name), "wechat") {
+			log.Printf("Found WeChat-related process: %s (PID: %d)", name, p.Pid)
+		}
+		if name == "WeChat.exe" || name == "Weixin.exe" {
+			info := WeChatInfo{}
 			info.ProcessID = uint32(p.Pid)
+			info.KeyProcessID = info.ProcessID // Default to same process
 			info.Is64Bits, _ = Is64BitProcess(info.ProcessID)
-			log.Println("ProcessID", info.ProcessID)
+
 			files, err := p.OpenFiles()
 			if err != nil {
-				log.Println("OpenFiles failed")
+				log.Printf("OpenFiles failed for PID %d: %v", p.Pid, err)
 				continue
 			}
 
 			for _, f := range files {
-				if strings.HasSuffix(f.Path, "\\Media.db") {
-					// fmt.Printf("opened %s\n", f.Path[4:])
+				// Support both old (Media.db) and new (media_0.db) WeChat database structures
+				if strings.HasSuffix(f.Path, "\\Media.db") || strings.HasSuffix(f.Path, "\\media_0.db") {
+					log.Printf("Found media database in PID %d: %s", p.Pid, f.Path)
 					filePath := f.Path
+					// Remove Windows long path prefix \\?\
+					if strings.HasPrefix(filePath, "\\\\?\\") {
+						filePath = filePath[4:]
+					}
 					parts := strings.Split(filePath, string(filepath.Separator))
 					if len(parts) < 4 {
 						log.Println("Error filePath " + filePath)
 						break
 					}
-					info.FilePath = strings.Join(parts[:len(parts)-2], string(filepath.Separator))
-					info.AcountName = strings.Join(parts[len(parts)-3:len(parts)-2], string(filepath.Separator))
+
+					// Detect if this is new or old WeChat structure based on path
+					isNewStructure := false
+					for i, part := range parts {
+						if part == "db_storage" && i > 0 {
+							isNewStructure = true
+							// In new structure, wxid is the part before db_storage
+							info.AcountName = parts[i-1]
+							info.FilePath = strings.Join(parts[:i], string(filepath.Separator))
+							log.Printf("Using new WeChat structure - AccountName: [%s], FilePath: [%s]", info.AcountName, info.FilePath)
+							break
+						}
+					}
+
+					// Fall back to old structure parsing
+					if !isNewStructure {
+						info.FilePath = strings.Join(parts[:len(parts)-2], string(filepath.Separator))
+						info.AcountName = strings.Join(parts[len(parts)-3:len(parts)-2], string(filepath.Separator))
+						log.Printf("Using old WeChat structure - AccountName: [%s], FilePath: [%s]", info.AcountName, info.FilePath)
+					}
+					dbProcesses = append(dbProcesses, info)
+					break
 				}
-
 			}
+		}
+	}
 
-			if len(info.FilePath) == 0 {
-				log.Println("wechat not log in")
-				continue
-			}
+	if len(dbProcesses) == 0 {
+		log.Println("No database processes found")
+		return
+	}
+	log.Printf("Found %d database process(es)", len(dbProcesses))
 
+	// Pass 2: Find main process with WeChatWin.dll
+	var mainProcess *WeChatInfo
+	for _, p := range processes {
+		name, err := p.Name()
+		if err != nil {
+			continue
+		}
+		if name == "WeChat.exe" || name == "Weixin.exe" {
 			hModuleSnap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPMODULE|windows.TH32CS_SNAPMODULE32, uint32(p.Pid))
 			if err != nil {
-				log.Println("CreateToolhelp32Snapshot failed", err)
 				continue
 			}
 			defer windows.CloseHandle(hModuleSnap)
@@ -639,56 +683,92 @@ func GetWeChatInfo() (list *WeChatInfoList) {
 
 			err = windows.Module32First(hModuleSnap, &me32)
 			if err != nil {
-				log.Println("Module32First failed", err)
 				continue
 			}
 
+			log.Printf("Searching for WeChatWin.dll/Weixin.dll in PID %d...", p.Pid)
+			dllCount := 0
+			wechatDlls := make([]string, 0)
 			for ; err == nil; err = windows.Module32Next(hModuleSnap, &me32) {
-				if windows.UTF16ToString(me32.Module[:]) == "WeChatWin.dll" {
-					// fmt.Printf("MODULE NAME: %s\n", windows.UTF16ToString(me32.Module[:]))
-					// fmt.Printf("executable NAME: %s\n", windows.UTF16ToString(me32.ExePath[:]))
-					// fmt.Printf("base address: 0x%08X\n", me32.ModBaseAddr)
-					// fmt.Printf("base ModBaseSize: %d\n", me32.ModBaseSize)
-					info.DllBaseAddr = me32.ModBaseAddr
-					info.DllBaseSize = me32.ModBaseSize
+				moduleName := windows.UTF16ToString(me32.Module[:])
+				dllCount++
+				// Log DLLs containing WeChat/Weixin/wx keywords
+				if strings.Contains(strings.ToLower(moduleName), "wechat") ||
+				   strings.Contains(strings.ToLower(moduleName), "weixin") ||
+				   strings.Contains(strings.ToLower(moduleName), "wx") ||
+				   strings.Contains(strings.ToLower(moduleName), "dll") {
+					wechatDlls = append(wechatDlls, moduleName)
+				}
+				// Support both old (WeChatWin.dll) and new (Weixin.dll) DLL names
+				if moduleName == "WeChatWin.dll" || moduleName == "Weixin.dll" {
+					log.Printf("Found main process with %s: PID %d", moduleName, p.Pid)
+					mainProcess = &WeChatInfo{}
+					mainProcess.ProcessID = uint32(p.Pid)
+					mainProcess.KeyProcessID = uint32(p.Pid)
+					mainProcess.Is64Bits, _ = Is64BitProcess(mainProcess.ProcessID)
+					mainProcess.DllBaseAddr = me32.ModBaseAddr
+					mainProcess.DllBaseSize = me32.ModBaseSize
 
+					// Get version info
 					var zero windows.Handle
 					driverPath := windows.UTF16ToString(me32.ExePath[:])
 					infoSize, err := windows.GetFileVersionInfoSize(driverPath, &zero)
-					if err != nil {
-						log.Println("GetFileVersionInfoSize failed", err)
-						break
+					if err == nil {
+						versionInfo := make([]byte, infoSize)
+						if err = windows.GetFileVersionInfo(driverPath, 0, infoSize, unsafe.Pointer(&versionInfo[0])); err == nil {
+							var fixedInfo *windows.VS_FIXEDFILEINFO
+							fixedInfoLen := uint32(unsafe.Sizeof(*fixedInfo))
+							err = windows.VerQueryValue(unsafe.Pointer(&versionInfo[0]), `\`, (unsafe.Pointer)(&fixedInfo), &fixedInfoLen)
+							if err == nil {
+								mainProcess.Version = fmt.Sprintf("%d.%d.%d.%d",
+									(fixedInfo.FileVersionMS>>16)&0xff,
+									(fixedInfo.FileVersionMS>>0)&0xff,
+									(fixedInfo.FileVersionLS>>16)&0xff,
+									(fixedInfo.FileVersionLS>>0)&0xff)
+								log.Printf("Main process version: %s", mainProcess.Version)
+							}
+						}
 					}
-					versionInfo := make([]byte, infoSize)
-					if err = windows.GetFileVersionInfo(driverPath, 0, infoSize, unsafe.Pointer(&versionInfo[0])); err != nil {
-						log.Println("GetFileVersionInfo failed", err)
-						break
-					}
-					var fixedInfo *windows.VS_FIXEDFILEINFO
-					fixedInfoLen := uint32(unsafe.Sizeof(*fixedInfo))
-					err = windows.VerQueryValue(unsafe.Pointer(&versionInfo[0]), `\`, (unsafe.Pointer)(&fixedInfo), &fixedInfoLen)
-					if err != nil {
-						log.Println("VerQueryValue failed", err)
-						break
-					}
-					// fmt.Printf("%s: v%d.%d.%d.%d\n", windows.UTF16ToString(me32.Module[:]),
-					// 	(fixedInfo.FileVersionMS>>16)&0xff,
-					// 	(fixedInfo.FileVersionMS>>0)&0xff,
-					// 	(fixedInfo.FileVersionLS>>16)&0xff,
-					// 	(fixedInfo.FileVersionLS>>0)&0xff)
-
-					info.Version = fmt.Sprintf("%d.%d.%d.%d",
-						(fixedInfo.FileVersionMS>>16)&0xff,
-						(fixedInfo.FileVersionMS>>0)&0xff,
-						(fixedInfo.FileVersionLS>>16)&0xff,
-						(fixedInfo.FileVersionLS>>0)&0xff)
-					list.Info = append(list.Info, info)
-					list.Total += 1
 					break
 				}
 			}
+			if mainProcess == nil {
+				// If WeChatWin.dll/Weixin.dll not found, log WeChat-related DLLs for debugging
+				log.Printf("PID %d: Scanned %d DLLs", p.Pid, dllCount)
+				if len(wechatDlls) > 0 {
+					log.Printf("PID %d: WeChat-related DLLs: %v", p.Pid, wechatDlls)
+				}
+			}
+			if mainProcess != nil {
+				break // Found main process
+			}
 		}
 	}
+
+	if mainProcess == nil {
+		log.Println("Warning: Could not find main process with WeChatWin.dll")
+		// Try to use database processes as-is (may not work for key extraction)
+		for _, info := range dbProcesses {
+			list.Info = append(list.Info, info)
+			list.Total++
+		}
+		log.Printf("GetWeChatInfo completed: found %d WeChat account(s) (without main process)", list.Total)
+		return
+	}
+
+	// Pass 3: Merge - use main process's DLL info for all database processes
+	for i := range dbProcesses {
+		dbProcesses[i].KeyProcessID = mainProcess.ProcessID
+		dbProcesses[i].DllBaseAddr = mainProcess.DllBaseAddr
+		dbProcesses[i].DllBaseSize = mainProcess.DllBaseSize
+		dbProcesses[i].Version = mainProcess.Version
+		list.Info = append(list.Info, dbProcesses[i])
+		list.Total++
+		log.Printf("Merged: account [%s] from DB PID %d using DLL from main PID %d",
+			dbProcesses[i].AcountName, dbProcesses[i].ProcessID, mainProcess.ProcessID)
+	}
+
+	log.Printf("GetWeChatInfo completed: found %d WeChat account(s)", list.Total)
 	return
 }
 
@@ -709,48 +789,311 @@ func Is64BitProcess(pid uint32) (bool, error) {
 }
 
 func GetWeChatKey(info *WeChatInfo) string {
-	mediaDB := info.FilePath + "\\Msg\\Media.db"
-	if _, err := os.Stat(mediaDB); err != nil {
-		log.Printf("open db %s error: %v", mediaDB, err)
-		return ""
+	// 支持新版和旧版微信数据库路径
+	var mediaDB string
+
+	// 尝试新版路径
+	newMediaPath := info.FilePath + "\\db_storage\\message\\media_0.db"
+	if _, err := os.Stat(newMediaPath); err == nil {
+		mediaDB = newMediaPath
+		log.Println("Using new Media DB path:", mediaDB)
+	} else {
+		// 使用旧版路径
+		mediaDB = info.FilePath + "\\Msg\\Media.db"
+		if _, err := os.Stat(mediaDB); err != nil {
+			log.Printf("open db %s error: %v", mediaDB, err)
+			return ""
+		}
+		log.Println("Using old Media DB path:", mediaDB)
 	}
 
-	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, uint32(info.ProcessID))
+	// Use KeyProcessID for memory reading (main process with WeChatWin.dll)
+	keyProcessID := info.KeyProcessID
+	if keyProcessID == 0 {
+		keyProcessID = info.ProcessID // Fallback to database process
+	}
+	log.Printf("Opening process PID %d for key extraction (database process: %d)", keyProcessID, info.ProcessID)
+
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, uint32(keyProcessID))
 	if err != nil {
-		log.Println("Error opening process:", err)
+		log.Printf("Error opening process %d: %v", keyProcessID, err)
 		return ""
 	}
 	defer windows.CloseHandle(handle)
 
-	buffer := make([]byte, info.DllBaseSize)
-	err = windows.ReadProcessMemory(handle, uintptr(info.DllBaseAddr), &buffer[0], uintptr(len(buffer)), nil)
-	if err != nil {
-		log.Println("Error ReadProcessMemory:", err)
+	if info.DllBaseAddr == 0 || info.DllBaseSize == 0 {
+		log.Printf("Invalid DLL info: BaseAddr=0x%X, BaseSize=%d", info.DllBaseAddr, info.DllBaseSize)
 		return ""
 	}
 
+	log.Printf("Reading process memory: PID=%d, Addr=0x%X, Size=%d", keyProcessID, info.DllBaseAddr, info.DllBaseSize)
+	buffer := make([]byte, info.DllBaseSize)
+	err = windows.ReadProcessMemory(handle, uintptr(info.DllBaseAddr), &buffer[0], uintptr(len(buffer)), nil)
+	if err != nil {
+		log.Printf("Error ReadProcessMemory: %v", err)
+		return ""
+	}
+
+	// Determine max search size (limit to avoid excessive memory scanning)
+	// WeChat 4.0+ may cache keys in various locations, so we need to search more memory
+	maxSearchSize := int(info.DllBaseSize)
+	if maxSearchSize > 50*1024*1024 { // Increased limit to 50MB for better coverage
+		maxSearchSize = 50 * 1024 * 1024
+	}
+	log.Printf("Starting key search in memory buffer (size: %d, max search: %d)", len(buffer), maxSearchSize)
+
+	// === Method 1: WCDB Cached Key Pattern (NEW - works for PC WeChat 4.0+) ===
+	log.Println("=== Method 1: Scanning for WCDB cached key pattern ===")
+	key := findWCDBCachedKeys(buffer, mediaDB, maxSearchSize)
+	if key != "" {
+		log.Printf("✓ Method 1 SUCCESS: Found WCDB cached key!")
+		return key
+	}
+	log.Println("× Method 1 FAILED: WCDB cached key pattern not found")
+
+	// === Method 2: Device Symbol Search (OLD - for mobile WeChat) ===
+	log.Println("=== Method 2: Trying device symbol search (legacy method) ===")
 	offset := 0
-	// searchStr := []byte(info.AcountName)
+	attemptCount := 0
 	for {
-		index := hasDeviceSybmol(buffer[offset:])
-		if index == -1 {
-			log.Println("has not DeviceSybmol")
+		if offset >= maxSearchSize-100 {
+			log.Printf("Search completed: reached max offset %d", offset)
 			break
 		}
+		index := hasDeviceSybmol(buffer[offset:])
+		if index == -1 {
+			log.Println("has not DeviceSybmol - tried to find device identifiers (android, iphone, ipad, etc.)")
+			log.Printf("Searched %d bytes without finding device symbols", offset)
+			break
+		}
+		attemptCount++
+		log.Printf("Attempt %d: hasDeviceSybmol found at offset 0x%X", attemptCount, index)
 		fmt.Printf("hasDeviceSybmol: 0x%X\n", index)
 		keys := findDBKeyPtr(buffer[offset:index], info.Is64Bits)
-		// fmt.Println("keys:", keys)
+		log.Printf("Found %d potential key pointers", len(keys))
 
-		key, err := findDBkey(handle, info.FilePath+"\\Msg\\Media.db", keys)
+		key, err := findDBkey(handle, mediaDB, keys)
 		if err == nil {
-			// fmt.Println("key:", key)
+			log.Printf("✓ Method 2 SUCCESS: Successfully extracted database key!")
 			return key
+		} else {
+			log.Printf("findDBkey failed with %d keys: %v", len(keys), err)
 		}
 
 		offset += (index + 20)
 	}
+	log.Printf("× Method 2 FAILED: Key extraction failed after %d attempts", attemptCount)
 
 	return ""
+}
+
+// findWCDBCachedKeys scans memory for WCDB cached key pattern: x'<hex_chars>'
+// WCDB (WeChat Database) caches derived keys in memory with this specific format
+// This approach works for PC WeChat 4.0+ and doesn't rely on mobile device identifiers
+//
+// Reference implementation: ylytdeng/wechat-decrypt/key_scan_common.py
+// Pattern: x'([0-9a-fA-F]{64,192})' - matches 64 to 192 hex characters
+//
+// The format can vary:
+// - 96 hex chars (64 key + 32 salt) - standard WCDB format
+// - 128 hex chars (64 key + 64 salt) - extended format
+// - Variable lengths between 64-192 chars
+func findWCDBCachedKeys(buffer []byte, mediaDB string, maxSearchSize int) string {
+	log.Printf("Scanning for WCDB cached key pattern in %d bytes (max: %d)", len(buffer), maxSearchSize)
+
+	// Debug: count how many "x" (0x78) bytes we find in the first 1MB
+	xCount := 0
+	for i := 0; i < 1024*1024 && i < len(buffer); i++ {
+		if buffer[i] == 0x78 {
+			xCount++
+		}
+	}
+	log.Printf("Debug: Found %d 'x' (0x78) bytes in first 1MB", xCount)
+
+	// Search size limited to avoid excessive scanning
+	searchSize := len(buffer)
+	if searchSize > maxSearchSize {
+		searchSize = maxSearchSize
+	}
+
+	attemptCount := 0
+	verifiedCount := 0
+
+	// Helper function to check if a byte is a valid hex character
+	isHexChar := func(b byte) bool {
+		return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+	}
+
+	// Helper function to extract hex string at position starting from hexStart
+	// Returns the hex string and the position of the closing quote, or empty string if invalid
+	extractHexString := func(buf []byte, start int, isUTF16 bool) ([]byte, int) {
+		var hexStr []byte
+		i := start
+
+		if isUTF16 {
+			// UTF-16LE: extract every other byte (skip the 0x00 bytes)
+			for i+1 < len(buf) {
+				if buf[i] == 0x27 && buf[i+1] == 0x00 {
+					// Found closing quote "'" in UTF-16LE
+					return hexStr, i + 2
+				}
+				if buf[i+1] != 0x00 {
+					// Not valid UTF-16LE (high byte should be 0x00)
+					return nil, -1
+				}
+				if !isHexChar(buf[i]) {
+					// Non-hex character found
+					return nil, -1
+				}
+				hexStr = append(hexStr, buf[i])
+				i += 2
+
+				// Safety limit to prevent infinite loops
+				if len(hexStr) > 256 {
+					return nil, -1
+				}
+			}
+		} else {
+			// ASCII/UTF-8: extract consecutive hex characters until closing quote
+			for i < len(buf) {
+				if buf[i] == '\'' {
+					// Found closing quote
+					return hexStr, i + 1
+				}
+				if !isHexChar(buf[i]) {
+					// Non-hex character found
+					return nil, -1
+				}
+				hexStr = append(hexStr, buf[i])
+				i++
+
+				// Safety limit
+				if len(hexStr) > 256 {
+					return nil, -1
+				}
+			}
+		}
+
+		return nil, -1
+	}
+
+	// Scan for the pattern "x'" followed by hex characters
+	for i := 0; i < searchSize-10; i++ {
+		// Look for "x'" pattern (UTF-8: 0x78 0x27, UTF-16LE: 0x78 0x00 0x27 0x00)
+		if buffer[i] == 0x78 {
+			// Check for ASCII/UTF-8 format: x'
+			if i+1 < len(buffer) && buffer[i+1] == 0x27 {
+				hexStr, endPos := extractHexString(buffer, i+2, false)
+				if hexStr != nil && len(hexStr) >= 64 && len(hexStr) <= 192 {
+					attemptCount++
+					if attemptCount <= 10 {
+						log.Printf("Attempt %d: Found WCDB pattern at offset 0x%X (ASCII, length: %d)", attemptCount, i, len(hexStr))
+					}
+
+					// For verification, we need at least 64 hex chars (32 bytes) for the key
+					// Extract first 64 hex chars as the candidate key
+					candidateKey := make([]byte, 32)
+					_, err := hex.Decode(candidateKey, hexStr[:64])
+					if err == nil {
+						if attemptCount <= 10 {
+							log.Printf("  Key hex: %s...", string(hexStr[:16]))
+						}
+
+						// Verify the key against the database
+						if checkDataBaseKeyWithIter(mediaDB, candidateKey, 256000) {
+							verifiedCount++
+							log.Printf("✓ Successfully verified WCDB cached key (attempt %d, verified %d, length: %d)", attemptCount, verifiedCount, len(hexStr))
+							return hex.EncodeToString(candidateKey)
+						} else if attemptCount <= 10 {
+							log.Printf("× Key verification failed for attempt %d (length: %d)", attemptCount, len(hexStr))
+						}
+					} else if attemptCount <= 10 {
+						log.Printf("× Failed to decode hex at attempt %d: %v", attemptCount, err)
+					}
+
+					// Skip to after the closing quote
+					if endPos > 0 {
+						i = endPos
+					}
+				} else if hexStr != nil && attemptCount <= 5 {
+					// Found pattern but wrong length
+					log.Printf("Found x' pattern at offset 0x%X but invalid length: %d (require 64-192)", i, len(hexStr))
+				}
+			}
+
+			// Check for UTF-16LE format: x\x0'\x0 (0x78 0x00 0x27 0x00)
+			if i+3 < len(buffer) && buffer[i+1] == 0x00 && buffer[i+2] == 0x27 && buffer[i+3] == 0x00 {
+				hexStr, endPos := extractHexString(buffer, i+4, true)
+				if hexStr != nil && len(hexStr) >= 64 && len(hexStr) <= 192 {
+					attemptCount++
+					if attemptCount <= 10 {
+						log.Printf("Attempt %d: Found WCDB pattern at offset 0x%X (UTF-16, length: %d)", attemptCount, i, len(hexStr))
+					}
+
+					// Extract first 64 hex chars as the candidate key
+					candidateKey := make([]byte, 32)
+					_, err := hex.Decode(candidateKey, hexStr[:64])
+					if err == nil {
+						if attemptCount <= 10 {
+							log.Printf("  Key hex: %s...", string(hexStr[:16]))
+						}
+
+						// Verify the key against the database
+						if checkDataBaseKeyWithIter(mediaDB, candidateKey, 256000) {
+							verifiedCount++
+							log.Printf("✓ Successfully verified WCDB cached key (attempt %d, verified %d, length: %d)", attemptCount, verifiedCount, len(hexStr))
+							return hex.EncodeToString(candidateKey)
+						} else if attemptCount <= 10 {
+							log.Printf("× Key verification failed for attempt %d (length: %d)", attemptCount, len(hexStr))
+						}
+					} else if attemptCount <= 10 {
+						log.Printf("× Failed to decode hex at attempt %d: %v", attemptCount, err)
+					}
+
+					// Skip to after the closing quote
+					if endPos > 0 {
+						i = endPos
+					}
+				} else if hexStr != nil && attemptCount <= 5 {
+					log.Printf("Found x' pattern at offset 0x%X but invalid length: %d (require 64-192)", i, len(hexStr))
+				}
+			}
+		}
+	}
+
+	log.Printf("WCDB cached key scan completed: %d attempts, %d verified", attemptCount, verifiedCount)
+	return ""
+}
+
+// checkDataBaseKeyWithIter verifies a database key with specified PBKDF2 iteration count
+// SQLCipher 4.0 uses 256,000 iterations (vs 64,000 in SQLCipher 3.x)
+func checkDataBaseKeyWithIter(path string, password []byte, iterations int) bool {
+	fp, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer fp.Close()
+
+	fpReader := bufio.NewReaderSize(fp, defaultPageSize*100)
+	buffer := make([]byte, defaultPageSize)
+
+	n, err := fpReader.Read(buffer)
+	if err != nil && n != defaultPageSize {
+		return false
+	}
+
+	salt := buffer[:16]
+	key := pbkdf2HMAC(password, salt, iterations, keySize)
+
+	page1 := buffer[16:defaultPageSize]
+	macSalt := xorBytes(salt, 0x3a)
+	macKey := pbkdf2HMAC(key, macSalt, 2, keySize)
+
+	hashMac := hmac.New(sha1.New, macKey)
+	hashMac.Write(page1[:len(page1)-32])
+	hashMac.Write([]byte{1, 0, 0, 0})
+
+	return hmac.Equal(hashMac.Sum(nil), page1[len(page1)-32:len(page1)-12])
 }
 
 func hasDeviceSybmol(buffer []byte) int {
